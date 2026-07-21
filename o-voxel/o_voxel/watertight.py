@@ -93,6 +93,8 @@ def flexible_dual_grid_to_watertight_mesh(
     aabb: Union[list, tuple, np.ndarray],
     voxel_size: Union[float, list, tuple, np.ndarray] = None,
     grid_size: Union[int, list, tuple, np.ndarray] = None,
+    mode: str = "solidify",
+    seal_radius: int = 3,
     seal_active_edges: bool = True,
     max_iters: int = 256,
     verbose: bool = False,
@@ -100,28 +102,46 @@ def flexible_dual_grid_to_watertight_mesh(
     """
     Extract a watertight, consistently oriented mesh from flexible dual grid data.
 
-    Signs are recovered by flood-filling the corner lattice from outside the
-    object: intersected edges (and, if `seal_active_edges`, edges whose 4
-    surrounding voxels are all active) block the flood. Corners never reached
-    are inside. A quad is emitted for every lattice edge whose endpoints have
+    An inside/outside sign field is recovered on the corner lattice; a quad is
+    then emitted for every lattice edge whose two endpoint corners carry
     different signs, connecting the dual vertices of the 4 voxels sharing the
     edge, wound so that face normals point outward.
+
+    Two sign-recovery modes are available:
+
+    - ``"solidify"`` (default, robust): the active voxel set is solidified by
+      dilate(seal_radius) -> fill enclosed holes -> erode(seal_radius), which
+      seals shell holes up to ~2*seal_radius voxels wide and fills the
+      enclosed interior. A corner is inside iff its 8 adjacent voxels are all
+      solid. Robust to the imperfect shells of generated data (open hair
+      cards, truncated limbs, missing patches); open sheets become thin
+      closed slabs instead of leaking.
+    - ``"flood"`` (exact): flood fill from outside over the corner lattice,
+      blocked by intersected edges (and, if `seal_active_edges`, edges whose
+      4 surrounding voxels are all active). Places the surface exactly on the
+      flagged edges, but any hole in the active shell lets the flood wash
+      into the interior — use only for data whose shell is known to be
+      closed (e.g. GT conversions of clean meshes).
+
+    In both modes duplicated parallel sheets collapse to the outermost one,
+    enclosed inner geometry is culled, and the enclosed interior becomes
+    solid.
 
     Args:
         coords: (N, 3) int voxel coordinates of active voxels.
         dual_vertices: (N, 3) float dual vertex positions, local to each voxel
             (same convention as ``flexible_dual_grid_to_mesh``: the world
             position is ``(coords + dual_vertices) * voxel_size + aabb[0]``).
-        intersected_flag: (N, 3) bool intersected flags.
+        intersected_flag: (N, 3) bool intersected flags (unused topologically
+            in "solidify" mode; geometry always uses the dual vertices).
         aabb: (2, 3) axis-aligned bounding box.
         voxel_size / grid_size: one of the two must be provided.
-        seal_active_edges: additionally block flood-fill on edges whose 4
-            surrounding voxels are all active. This seals pinholes (missing
-            flags) wherever the active shell is closed and keeps the flood
-            from washing through thick active blobs. Recommended for
-            generated (imperfect) data; for exact GT round-trips of clean
-            watertight meshes it can be disabled.
-        max_iters: safety cap on flood-fill sweeps.
+        mode: sign recovery mode, "solidify" or "flood" (see above).
+        seal_radius: hole-sealing radius in voxels for "solidify" mode.
+        seal_active_edges: "flood" mode only — additionally block flood-fill
+            on edges whose 4 surrounding voxels are all active, sealing
+            pinholes (missing flags) wherever the active shell is closed.
+        max_iters: "flood" mode only — safety cap on flood-fill sweeps.
         verbose: print statistics.
 
     Returns:
@@ -166,62 +186,116 @@ def flexible_dual_grid_to_watertight_mesh(
     A = np.zeros(tuple(D), dtype=bool)
     A[vc[:, 0], vc[:, 1], vc[:, 2]] = True
 
-    # ---------------------------------------------------------- #
-    # Voxel-level empty space labeling: which empty voxels are   #
-    # connected to the outside (6-connectivity)?                 #
-    # ---------------------------------------------------------- #
-    labels, _ = ndimage.label(~A)
-    border_labels = np.unique(np.concatenate([
-        labels[0].ravel(), labels[-1].ravel(),
-        labels[:, 0].ravel(), labels[:, -1].ravel(),
-        labels[:, :, 0].ravel(), labels[:, :, -1].ravel(),
-    ]))
-    border_labels = border_labels[border_labels != 0]
-    outside_empty = np.isin(labels, border_labels)
-    del labels
-
-    # ------------------------------------------------------ #
-    # Edge cuts on the corner lattice                        #
-    # ------------------------------------------------------ #
-    # Flag of voxel v on axis a refers to the lattice edge along a located at
-    # v's max corner in the two perpendicular axes:
-    #     lower corner c = v + e_b + e_c,   edge c -> c + e_a
     C = tuple(D + 1)
-    cuts = []
-    for a in range(3):
-        b, c = _PERP[a]
-        cut = np.zeros(C, dtype=bool)
-        holders = vc[intersected[:, a]]
-        cc = holders.copy()
-        cc[:, b] += 1
-        cc[:, c] += 1
-        cut[cc[:, 0], cc[:, 1], cc[:, 2]] = True
-        if seal_active_edges:
-            cut |= _edge_all4_active(A, a)
-        cuts.append(cut)
+    if mode == "solidify":
+        # ------------------------------------------------------ #
+        # Solidify the active shell: dilate -> fill -> erode.    #
+        # Seals holes up to ~2*seal_radius wide and fills the    #
+        # enclosed interior, then sign corners against the solid #
+        # ------------------------------------------------------ #
+        solid = ndimage.binary_dilation(A, iterations=seal_radius)
+        solid = ndimage.binary_fill_holes(solid)
+        solid = ndimage.binary_erosion(solid, iterations=seal_radius, border_value=0)
+        solid |= A
+        # corner is outside iff any of its 8 adjacent voxels is non-solid
+        S = _shift_or8(~solid)
+        del solid
+    elif mode == "flood":
+        # ---------------------------------------------------------- #
+        # Voxel-level empty space labeling: which empty voxels are   #
+        # connected to the outside (6-connectivity)?                 #
+        # ---------------------------------------------------------- #
+        labels, _ = ndimage.label(~A)
+        border_labels = np.unique(np.concatenate([
+            labels[0].ravel(), labels[-1].ravel(),
+            labels[:, 0].ravel(), labels[:, -1].ravel(),
+            labels[:, :, 0].ravel(), labels[:, :, -1].ravel(),
+        ]))
+        border_labels = border_labels[border_labels != 0]
+        outside_empty = np.isin(labels, border_labels)
+        del labels
 
-    # ------------------------------------------------------ #
-    # Flood fill outside signs over the corner lattice       #
-    # ------------------------------------------------------ #
-    S = _shift_or8(outside_empty)  # corners touching outside-connected empty space
-
-    for it in range(max_iters):
-        before = int(S.sum())
+        # ------------------------------------------------------ #
+        # Edge cuts on the corner lattice                        #
+        # ------------------------------------------------------ #
+        # Flag of voxel v on axis a refers to the lattice edge along a located
+        # at v's max corner in the two perpendicular axes:
+        #     lower corner c = v + e_b + e_c,   edge c -> c + e_a
+        cuts = []
         for a in range(3):
-            sl_lo = [slice(None)] * 3
-            sl_hi = [slice(None)] * 3
-            sl_lo[a] = slice(0, C[a] - 1)   # corner c (edge c -> c + e_a)
-            sl_hi[a] = slice(1, C[a])       # corner c + e_a
-            sl_lo, sl_hi = tuple(sl_lo), tuple(sl_hi)
-            open_edge = ~cuts[a][sl_lo]
-            # monotone in-place ORs are safe under the overlapping views
-            S[sl_hi] |= S[sl_lo] & open_edge
-            S[sl_lo] |= S[sl_hi] & open_edge
-        if int(S.sum()) == before:
-            break
+            b, c = _PERP[a]
+            cut = np.zeros(C, dtype=bool)
+            holders = vc[intersected[:, a]]
+            cc = holders.copy()
+            cc[:, b] += 1
+            cc[:, c] += 1
+            cut[cc[:, 0], cc[:, 1], cc[:, 2]] = True
+            if seal_active_edges:
+                cut |= _edge_all4_active(A, a)
+            cuts.append(cut)
+
+        # ------------------------------------------------------ #
+        # Flood fill outside signs over the corner lattice       #
+        # ------------------------------------------------------ #
+        S = _shift_or8(outside_empty)  # corners touching outside-connected empty space
+
+        for it in range(max_iters):
+            before = int(S.sum())
+            for a in range(3):
+                sl_lo = [slice(None)] * 3
+                sl_hi = [slice(None)] * 3
+                sl_lo[a] = slice(0, C[a] - 1)   # corner c (edge c -> c + e_a)
+                sl_hi[a] = slice(1, C[a])       # corner c + e_a
+                sl_lo, sl_hi = tuple(sl_lo), tuple(sl_hi)
+                open_edge = ~cuts[a][sl_lo]
+                # monotone in-place ORs are safe under the overlapping views
+                S[sl_hi] |= S[sl_lo] & open_edge
+                S[sl_lo] |= S[sl_hi] & open_edge
+            if int(S.sum()) == before:
+                break
+        else:
+            import warnings
+            warnings.warn(f"flood fill did not converge within {max_iters} sweeps")
+        del cuts
     else:
-        import warnings
-        warnings.warn(f"flood fill did not converge within {max_iters} sweeps")
+        raise ValueError(f"Unknown mode: {mode!r} (expected 'solidify' or 'flood')")
+
+    # ------------------------------------------------------ #
+    # Resolve checkerboard plaquettes (pinch edges).         #
+    # A 2x2 corner plaquette whose signs alternate           #
+    # diagonally emits 4 faces sharing one mesh edge (non-   #
+    # manifold). Flip one outside corner to inside (locally  #
+    # growing the solid) until no such plaquette remains.    #
+    # ------------------------------------------------------ #
+    for _ in range(64):
+        n_flip = 0
+        for a in range(3):
+            b, c = _PERP[a]
+            sl00 = [slice(None)] * 3
+            sl10 = [slice(None)] * 3
+            sl01 = [slice(None)] * 3
+            sl11 = [slice(None)] * 3
+            sl00[b] = slice(0, C[b] - 1); sl00[c] = slice(0, C[c] - 1)
+            sl10[b] = slice(1, C[b]);     sl10[c] = slice(0, C[c] - 1)
+            sl01[b] = slice(0, C[b] - 1); sl01[c] = slice(1, C[c])
+            sl11[b] = slice(1, C[b]);     sl11[c] = slice(1, C[c])
+            s00, s10 = S[tuple(sl00)], S[tuple(sl10)]
+            s01, s11 = S[tuple(sl01)], S[tuple(sl11)]
+            # checkerboard: main diagonal equal, anti-diagonal equal, differ
+            cb = (s00 == s11) & (s10 == s01) & (s00 != s10)
+            if not cb.any():
+                continue
+            # flip an outside (True) corner to inside: s00 if s00 is the
+            # outside diagonal, else s10
+            flip00 = cb & s00
+            flip10 = cb & s10
+            v = S[tuple(sl00)]
+            v &= ~flip00
+            v = S[tuple(sl10)]
+            v &= ~flip10
+            n_flip += int(flip00.sum()) + int(flip10.sum())
+        if n_flip == 0:
+            break
 
     # ------------------------------------------------------ #
     # Emit quads on sign-change edges                        #

@@ -120,7 +120,7 @@ rec_verts, rec_faces = o_voxel.watertight.flexible_dual_grid_to_watertight_mesh(
 )
 ```
 
-It recovers inside/outside signs by flood-filling the corner lattice from outside the object (intersected edges act as barriers) and only emits faces that bound the enclosed volume: duplicated parallel sheets collapse to the outermost one, enclosed inner geometry is culled, pinholes are sealed as long as the voxel shell is closed, and dangling open sheets are dropped. Pure NumPy/SciPy, no CUDA extension required.
+It recovers an inside/outside sign field on the corner lattice and only emits faces that bound the enclosed volume: duplicated parallel sheets collapse to the outermost one, enclosed inner geometry is culled, shell holes are sealed, and dangling open sheets are dropped. Two modes are available: `"solidify"` (default) reconstructs a solid via dilate-fill-erode and is robust to the imperfect shells of generated data (open hair cards, truncated limbs, missing patches up to `2*seal_radius` voxels); `"flood"` flood-fills from outside with intersected edges as barriers and places the surface exactly on the flagged edges, but requires a closed shell. Pure NumPy/SciPy, no CUDA extension required.
 
 ### 3. Export to GLB [[link]](examples/ovox2glb.py)
 For visualization in standard 3D viewers, you can clean, UV-unwrap, and bake the volumetric attributes into textures.
