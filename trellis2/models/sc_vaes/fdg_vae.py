@@ -18,6 +18,7 @@ from .sparse_unet_vae import (
 )
 from ...representations import Mesh
 from o_voxel.convert import flexible_dual_grid_to_mesh
+from o_voxel.watertight import flexible_dual_grid_to_watertight_mesh
 
 
 class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):
@@ -65,7 +66,8 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
     ):
         self.resolution = resolution
         self.voxel_margin = voxel_margin
-        
+        self.watertight = False
+
         super().__init__(
             7,
             model_channels,
@@ -79,6 +81,18 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
 
     def set_resolution(self, resolution: int) -> None:
         self.resolution = resolution
+
+    def set_watertight(self, watertight: bool = True) -> None:
+        """
+        Toggle watertight mesh extraction at inference.
+
+        When enabled, meshes are extracted with sign-recovering flood fill
+        (o_voxel.watertight): the output is closed and consistently oriented,
+        duplicated parallel sheets collapse to the outermost one, and enclosed
+        inner geometry is culled. Runs on CPU and is slower than the default
+        sign-free extraction.
+        """
+        self.watertight = watertight
         
     def forward(self, x: sp.SparseTensor, gt_intersected: sp.SparseTensor = None, **kwargs):
         decoded = super().forward(x, **kwargs)
@@ -100,11 +114,18 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
             vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
             intersected = h.replace(h.feats[..., 3:6] > 0)
             quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
-            mesh = [Mesh(*flexible_dual_grid_to_mesh(
-                v.coords[:, 1:], v.feats, i.feats, q.feats,
-                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                grid_size=self.resolution,
-                train=False
-            )) for v, i, q in zip(vertices, intersected, quad_lerp)]
+            if self.watertight:
+                mesh = [Mesh(*flexible_dual_grid_to_watertight_mesh(
+                    v.coords[:, 1:], v.feats, i.feats,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    grid_size=self.resolution,
+                )) for v, i in zip(vertices, intersected)]
+            else:
+                mesh = [Mesh(*flexible_dual_grid_to_mesh(
+                    v.coords[:, 1:], v.feats, i.feats, q.feats,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    grid_size=self.resolution,
+                    train=False
+                )) for v, i, q in zip(vertices, intersected, quad_lerp)]
             out_list[0] = mesh
             return out_list[0] if len(out_list) == 1 else tuple(out_list)

@@ -107,6 +107,21 @@ rec_verts, rec_faces = o_voxel.convert.flexible_dual_grid_to_mesh(
 )
 ```
 
+#### Watertight Extraction [[link]](examples/ovox2watertight.py)
+`flexible_dual_grid_to_mesh` is sign-free: it emits one quad per intersected edge, faithfully reproducing open surfaces — but also double-layer walls and enclosed inner geometry, with no consistent orientation. When you need a closed, consistently oriented outer surface (e.g. for printing, simulation, or downstream tools that require watertight input), use the flood-fill based extractor instead:
+
+```python
+rec_verts, rec_faces = o_voxel.watertight.flexible_dual_grid_to_watertight_mesh(
+    coords,
+    dual_vertices,
+    intersected,
+    grid_size=RES,
+    aabb=[[-0.5,-0.5,-0.5],[0.5,0.5,0.5]],
+)
+```
+
+It recovers inside/outside signs by flood-filling the corner lattice from outside the object (intersected edges act as barriers) and only emits faces that bound the enclosed volume: duplicated parallel sheets collapse to the outermost one, enclosed inner geometry is culled, pinholes are sealed as long as the voxel shell is closed, and dangling open sheets are dropped. Pure NumPy/SciPy, no CUDA extension required.
+
 ### 3. Export to GLB [[link]](examples/ovox2glb.py)
 For visualization in standard 3D viewers, you can clean, UV-unwrap, and bake the volumetric attributes into textures.
 

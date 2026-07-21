@@ -3,5 +3,6 @@ from . import (
     io,
     postprocess,
     rasterize,
-    serialize
+    serialize,
+    watertight,
 )

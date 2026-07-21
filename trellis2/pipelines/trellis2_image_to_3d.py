@@ -367,18 +367,23 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         self,
         slat: SparseTensor,
         resolution: int,
+        watertight: bool = False,
     ) -> Tuple[List[Mesh], List[SparseTensor]]:
         """
         Decode the structured latent.
 
         Args:
             slat (SparseTensor): The structured latent.
+            watertight (bool): Extract a closed, consistently oriented outer
+                surface instead of the raw sign-free surface. Culls double
+                layers and enclosed inner geometry (slower, runs on CPU).
 
         Returns:
             List[Mesh]: The decoded meshes.
             List[SparseTensor]: The decoded substructures.
         """
         self.models['shape_slat_decoder'].set_resolution(resolution)
+        self.models['shape_slat_decoder'].set_watertight(watertight)
         if self.low_vram:
             self.models['shape_slat_decoder'].to(self.device)
             self.models['shape_slat_decoder'].low_vram = True
@@ -458,6 +463,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         shape_slat: SparseTensor,
         tex_slat: SparseTensor,
         resolution: int,
+        watertight: bool = False,
     ) -> List[MeshWithVoxel]:
         """
         Decode the latent codes.
@@ -466,12 +472,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             shape_slat (SparseTensor): The structured latent for shape.
             tex_slat (SparseTensor): The structured latent for texture.
             resolution (int): The resolution of the output.
+            watertight (bool): Extract closed, consistently oriented meshes
+                (culls double layers and enclosed inner geometry).
         """
-        meshes, subs = self.decode_shape_slat(shape_slat, resolution)
+        meshes, subs = self.decode_shape_slat(shape_slat, resolution, watertight=watertight)
         tex_voxels = self.decode_tex_slat(tex_slat, subs)
         out_mesh = []
         for m, v in zip(meshes, tex_voxels):
-            m.fill_holes()
+            if not watertight:
+                m.fill_holes()
             out_mesh.append(
                 MeshWithVoxel(
                     m.vertices, m.faces,
@@ -498,6 +507,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
+        watertight: bool = False,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -513,6 +523,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            watertight (bool): Extract closed, consistently oriented meshes.
+                Collapses double-layer walls to the outermost sheet and culls
+                geometry fully enclosed by the outer surface (slower, CPU).
         """
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
@@ -588,7 +601,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 shape_slat, tex_slat_sampler_params
             )
         torch.cuda.empty_cache()
-        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        out_mesh = self.decode_latent(shape_slat, tex_slat, res, watertight=watertight)
         if return_latent:
             return out_mesh, (shape_slat, tex_slat, res)
         else:
