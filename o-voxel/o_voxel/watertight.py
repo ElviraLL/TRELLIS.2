@@ -95,6 +95,7 @@ def flexible_dual_grid_to_watertight_mesh(
     grid_size: Union[int, list, tuple, np.ndarray] = None,
     mode: str = "solidify",
     seal_radius: int = 3,
+    keep_largest_component: bool = True,
     seal_active_edges: bool = True,
     max_iters: int = 256,
     verbose: bool = False,
@@ -138,6 +139,9 @@ def flexible_dual_grid_to_watertight_mesh(
         voxel_size / grid_size: one of the two must be provided.
         mode: sign recovery mode, "solidify" or "flood" (see above).
         seal_radius: hole-sealing radius in voxels for "solidify" mode.
+        keep_largest_component: keep only the largest connected solid region
+            and drop all smaller disconnected pieces (floating hair
+            fragments, debris), so the output is a single body.
         seal_active_edges: "flood" mode only — additionally block flood-fill
             on edges whose 4 surrounding voxels are all active, sealing
             pinholes (missing flags) wherever the active shell is closed.
@@ -296,6 +300,25 @@ def flexible_dual_grid_to_watertight_mesh(
             n_flip += int(flip00.sum()) + int(flip10.sum())
         if n_flip == 0:
             break
+
+    # ------------------------------------------------------ #
+    # Keep only the largest connected inside region.         #
+    # (Run after pinch resolution: edge-adjacent inside      #
+    # corners share a component, so dropping whole           #
+    # components cannot create new checkerboards.)           #
+    # ------------------------------------------------------ #
+    if keep_largest_component:
+        inside = ~S
+        labels, n_comp = ndimage.label(inside)
+        if n_comp > 1:
+            sizes = np.bincount(labels.ravel())
+            sizes[0] = 0
+            largest = int(np.argmax(sizes))
+            S |= inside & (labels != largest)
+            if verbose:
+                print(f"[watertight] kept largest of {n_comp} solid components "
+                      f"({sizes[largest]} corners), dropped {n_comp - 1}")
+        del labels, inside
 
     # ------------------------------------------------------ #
     # Emit quads on sign-change edges                        #
