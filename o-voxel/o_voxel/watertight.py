@@ -63,6 +63,45 @@ def _shift_or8(v):
     return out
 
 
+def _resolve_checkerboard_pinches(S, C, max_iters=64):
+    """Resolve checkerboard plaquettes (pinch edges) on the corner sign grid
+    `S` (True = outside), in place.
+
+    A 2x2 corner plaquette whose signs alternate diagonally emits 4 faces
+    sharing one mesh edge (non-manifold). Flip one outside corner to inside
+    (locally growing the solid) until no such plaquette remains.
+    """
+    for _ in range(max_iters):
+        n_flip = 0
+        for a in range(3):
+            b, c = _PERP[a]
+            sl00 = [slice(None)] * 3
+            sl10 = [slice(None)] * 3
+            sl01 = [slice(None)] * 3
+            sl11 = [slice(None)] * 3
+            sl00[b] = slice(0, C[b] - 1); sl00[c] = slice(0, C[c] - 1)
+            sl10[b] = slice(1, C[b]);     sl10[c] = slice(0, C[c] - 1)
+            sl01[b] = slice(0, C[b] - 1); sl01[c] = slice(1, C[c])
+            sl11[b] = slice(1, C[b]);     sl11[c] = slice(1, C[c])
+            s00, s10 = S[tuple(sl00)], S[tuple(sl10)]
+            s01, s11 = S[tuple(sl01)], S[tuple(sl11)]
+            # checkerboard: main diagonal equal, anti-diagonal equal, differ
+            cb = (s00 == s11) & (s10 == s01) & (s00 != s10)
+            if not cb.any():
+                continue
+            # flip an outside (True) corner to inside: s00 if s00 is the
+            # outside diagonal, else s10
+            flip00 = cb & s00
+            flip10 = cb & s10
+            v = S[tuple(sl00)]
+            v &= ~flip00
+            v = S[tuple(sl10)]
+            v &= ~flip10
+            n_flip += int(flip00.sum()) + int(flip10.sum())
+        if n_flip == 0:
+            break
+
+
 def _edge_all4_active(A, axis):
     """For each lattice edge along `axis` at lower corner c, whether the 4
     voxels sharing that edge are all active.
@@ -310,50 +349,47 @@ def flexible_dual_grid_to_watertight_mesh(
 
     # ------------------------------------------------------ #
     # Resolve checkerboard plaquettes (pinch edges).         #
-    # A 2x2 corner plaquette whose signs alternate           #
-    # diagonally emits 4 faces sharing one mesh edge (non-   #
-    # manifold). Flip one outside corner to inside (locally  #
-    # growing the solid) until no such plaquette remains.    #
     # ------------------------------------------------------ #
-    for _ in range(64):
-        n_flip = 0
-        for a in range(3):
-            b, c = _PERP[a]
-            sl00 = [slice(None)] * 3
-            sl10 = [slice(None)] * 3
-            sl01 = [slice(None)] * 3
-            sl11 = [slice(None)] * 3
-            sl00[b] = slice(0, C[b] - 1); sl00[c] = slice(0, C[c] - 1)
-            sl10[b] = slice(1, C[b]);     sl10[c] = slice(0, C[c] - 1)
-            sl01[b] = slice(0, C[b] - 1); sl01[c] = slice(1, C[c])
-            sl11[b] = slice(1, C[b]);     sl11[c] = slice(1, C[c])
-            s00, s10 = S[tuple(sl00)], S[tuple(sl10)]
-            s01, s11 = S[tuple(sl01)], S[tuple(sl11)]
-            # checkerboard: main diagonal equal, anti-diagonal equal, differ
-            cb = (s00 == s11) & (s10 == s01) & (s00 != s10)
-            if not cb.any():
-                continue
-            # flip an outside (True) corner to inside: s00 if s00 is the
-            # outside diagonal, else s10
-            flip00 = cb & s00
-            flip10 = cb & s10
-            v = S[tuple(sl00)]
-            v &= ~flip00
-            v = S[tuple(sl10)]
-            v &= ~flip10
-            n_flip += int(flip00.sum()) + int(flip10.sum())
-        if n_flip == 0:
-            break
+    _resolve_checkerboard_pinches(S, C)
 
     # ------------------------------------------------------ #
     # Keep only the largest connected inside region.         #
     # (Run after pinch resolution: edge-adjacent inside      #
     # corners share a component, so dropping whole           #
     # components cannot create new checkerboards.)           #
+    #                                                         #
+    # Before dropping: weld corner-level components that are #
+    # close to the main one. Thin (few-corner-thick) shells   #
+    # can be voxel-connected to the body yet still fragment   #
+    # into many small disconnected inside-corner components  #
+    # (e.g. hair sheets), which the voxel-level bridge above  #
+    # cannot see since it operates on `solid`, not `~S`. Weld #
+    # them the same way: dilate the main inside component and #
+    # the rest separately, and mark their overlap inside too. #
+    # This can create new checkerboards, so pinch-resolution  #
+    # is re-run before the final labeling/drop.               #
     # ------------------------------------------------------ #
     if keep_largest_component:
         inside = ~S
         labels, n_comp = ndimage.label(inside)
+        if n_comp > 1 and bridge_distance > 0:
+            sizes = np.bincount(labels.ravel())
+            sizes[0] = 0
+            main_label = int(np.argmax(sizes))
+            main = labels == main_label
+            rest = inside & ~main
+            dil_main = ndimage.binary_dilation(main, iterations=bridge_distance)
+            dil_rest = ndimage.binary_dilation(rest, iterations=bridge_distance)
+            weld = dil_main & dil_rest
+            if weld.any():
+                S &= ~weld
+                if verbose:
+                    print(f"[watertight] corner-level bridge_distance={bridge_distance}: "
+                          f"welded {int(weld.sum())} corners across {n_comp} inside components")
+                _resolve_checkerboard_pinches(S, C)
+                inside = ~S
+                labels, n_comp = ndimage.label(inside)
+            del main, rest, dil_main, dil_rest, weld
         if n_comp > 1:
             sizes = np.bincount(labels.ravel())
             sizes[0] = 0
