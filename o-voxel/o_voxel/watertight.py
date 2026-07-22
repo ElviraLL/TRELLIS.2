@@ -95,9 +95,12 @@ def flexible_dual_grid_to_watertight_mesh(
     grid_size: Union[int, list, tuple, np.ndarray] = None,
     mode: str = "solidify",
     seal_radius: int = 3,
+    bridge_distance: int = 4,
     keep_largest_component: bool = True,
     seal_active_edges: bool = True,
     max_iters: int = 256,
+    smooth_iters: int = 10,
+    smooth_anchor_weight: float = 0.15,
     verbose: bool = False,
 ):
     """
@@ -139,6 +142,13 @@ def flexible_dual_grid_to_watertight_mesh(
         voxel_size / grid_size: one of the two must be provided.
         mode: sign recovery mode, "solidify" or "flood" (see above).
         seal_radius: hole-sealing radius in voxels for "solidify" mode.
+        bridge_distance: "solidify" mode only — before dropping disconnected
+            pieces, locally weld any piece whose gap to the main body is at
+            most ~2*bridge_distance voxels (e.g. hair sheets floating a few
+            voxels off the scalp), by dilating the main body and the rest
+            separately and solidifying where the two dilations overlap.
+            Pieces farther away stay disconnected and are still dropped by
+            `keep_largest_component`. Set to 0 to disable.
         keep_largest_component: keep only the largest connected solid region
             and drop all smaller disconnected pieces (floating hair
             fragments, debris), so the output is a single body.
@@ -146,6 +156,16 @@ def flexible_dual_grid_to_watertight_mesh(
             on edges whose 4 surrounding voxels are all active, sealing
             pinholes (missing flags) wherever the active shell is closed.
         max_iters: "flood" mode only — safety cap on flood-fill sweeps.
+        smooth_iters: number of constrained Taubin smoothing iterations
+            applied to the final vertices (0 disables). Synthesized
+            voxel-center vertices (blocky, from missing dual data) are
+            smoothed freely; accurate QEF dual vertices are anchored and
+            move only a little, weighted by `smooth_anchor_weight`. Topology
+            (faces) is unchanged, so watertightness and orientation are
+            preserved.
+        smooth_anchor_weight: how much QEF dual vertices are allowed to move
+            during smoothing, relative to synthesized voxel-center vertices
+            (which move with weight 1.0). 0 fully freezes dual vertices.
         verbose: print statistics.
 
     Returns:
@@ -201,6 +221,30 @@ def flexible_dual_grid_to_watertight_mesh(
         solid = ndimage.binary_fill_holes(solid)
         solid = ndimage.binary_erosion(solid, iterations=seal_radius, border_value=0)
         solid |= A
+
+        # -------------------------------------------------------------- #
+        # Bridge nearby disconnected pieces to the main body before      #
+        # keep_largest_component would otherwise drop them (e.g. hair    #
+        # sheets floating a few voxels off the scalp).                   #
+        # -------------------------------------------------------------- #
+        if bridge_distance > 0:
+            labels, n_comp = ndimage.label(solid)
+            if n_comp > 1:
+                sizes = np.bincount(labels.ravel())
+                sizes[0] = 0
+                main_label = int(np.argmax(sizes))
+                main = labels == main_label
+                rest = solid & ~main
+                dil_main = ndimage.binary_dilation(main, iterations=bridge_distance)
+                dil_rest = ndimage.binary_dilation(rest, iterations=bridge_distance)
+                solid |= (dil_main & dil_rest)
+                # welding can enclose air pockets between the bridged pieces
+                solid = ndimage.binary_fill_holes(solid)
+                if verbose:
+                    print(f"[watertight] bridge_distance={bridge_distance}: "
+                          f"{n_comp} components, welded gaps within reach of main body")
+                del labels, main, rest, dil_main, dil_rest
+
         # corner is outside iff any of its 8 adjacent voxels is non-solid
         S = _shift_or8(~solid)
         del solid
@@ -421,8 +465,39 @@ def flexible_dual_grid_to_watertight_mesh(
     used = np.zeros(len(vertices), dtype=bool)
     used[faces.ravel()] = True
     remap = np.cumsum(used) - 1
+    is_center_final = (np.arange(len(vertices)) >= N)[used]
     vertices = vertices[used]
     faces = remap[faces]
+
+    # ------------------------------------------------------ #
+    # Constrained Taubin smoothing: synthesized voxel-center  #
+    # vertices (blocky) smooth freely, accurate QEF dual      #
+    # vertices are anchored and move only a little. Topology  #
+    # (faces) is unchanged, so watertightness/orientation is  #
+    # preserved by construction.                              #
+    # ------------------------------------------------------ #
+    if smooth_iters > 0 and len(faces) > 0:
+        from scipy import sparse
+
+        V = len(vertices)
+        edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=0)
+        edges = np.sort(edges, axis=1)
+        edges = np.unique(edges, axis=0)
+        rows = np.concatenate([edges[:, 0], edges[:, 1]])
+        cols = np.concatenate([edges[:, 1], edges[:, 0]])
+        data = np.ones(len(rows), dtype=np.float32)
+        adjacency = sparse.csr_matrix((data, (rows, cols)), shape=(V, V))
+        deg = np.asarray(adjacency.sum(axis=1)).reshape(-1)
+        deg = np.clip(deg, 1.0, None)
+
+        w = np.where(is_center_final, 1.0, smooth_anchor_weight).astype(np.float32)[:, None]
+
+        for _ in range(smooth_iters):
+            avg = (adjacency @ vertices) / deg[:, None]
+            vertices += 0.5 * w * (avg - vertices)
+            avg = (adjacency @ vertices) / deg[:, None]
+            vertices += -0.53 * w * (avg - vertices)
+        vertices = vertices.astype(np.float32)
 
     if verbose:
         n_out = int(S.sum())
